@@ -1,0 +1,11 @@
+Invoke-RestMethod -Uri "https://duketoms-fastapi-render.onrender.com/api/chat" `
+  -Method POST `
+  -Headers @{ "Content-Type" = "application/json" } `
+  -Body '{"message":"What products do you offer?"}'
+
+
+
+Invoke-RestMethod -Uri " http://127.0.0.1:8000/api/chat" `
+  -Method POST `
+  -Headers @{ "Content-Type" = "application/json" } `
+  -Body '{"message":"What products do you offer?"}'

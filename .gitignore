@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+.idea
+chabotlogger-93afbe5bdc6f
+requirements_flask.txt

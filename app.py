@@ -1,15 +1,15 @@
-
-from sklearn.metrics.pairwise import cosine_similarity
-from datetime import datetime
-from typing import List, Dict
-import numpy as np
+# app.py
 import os
 import json
+from datetime import datetime
+from typing import List, Dict, Tuple
+import numpy as np
+import faiss
 import openai
 import tiktoken
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -23,12 +23,6 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 VECTOR_DB_DIR = "vector_db"
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 SHEET_NAME = "Sheet1"
-
-# GOOGLE_CREDS_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
-
-# Google Sheets API Setup
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-# Load Google service account credentials from environment variable
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 
 if not GOOGLE_CREDS_JSON:
@@ -36,26 +30,26 @@ if not GOOGLE_CREDS_JSON:
 
 try:
     creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     sheets_service = build("sheets", "v4", credentials=creds)
+    sheet = sheets_service.spreadsheets()
 except Exception as e:
     raise RuntimeError(f"Failed to load Google credentials: {str(e)}")
-
-sheet = sheets_service.spreadsheets()
 
 # ========== FastAPI App Initialization ==========
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # You can restrict this
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ========== Global State ==========
-combined_embeddings = None
-all_chunks = []
+faiss_index = None
+combined_chunks: List[Dict] = []
+index_dimension = None
 
 # ========== Pydantic Models ==========
 class ChatMessage(BaseModel):
@@ -64,82 +58,202 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[ChatMessage]  # Frontend sends chat history
-    clientId: str  # Add this line
+    history: List[ChatMessage]
+    clientId: str
 
 class ChatResponse(BaseModel):
     reply: str
 
-# ========== Utility Functions ==========
+# ========== Utilities ==========
 def log_to_google_sheet(row_data: List):
-    sheet.values().append(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_NAME}!A1",
-        valueInputOption="USER_ENTERED",
-        body={"values": [row_data]}
-    ).execute()
+    try:
+        sheet.values().append(
+            spreadsheetId=SHEET_ID,
+            range=f"{SHEET_NAME}!A1",
+            valueInputOption="USER_ENTERED",
+            body={"values": [row_data]}
+        ).execute()
+    except Exception as e:
+        print("Failed to log to Google Sheets:", e)
+
 
 def count_tokens(text: str, model: str = "gpt-4"):
     encoding = tiktoken.encoding_for_model(model)
     return len(encoding.encode(text))
 
-def get_openai_embedding(text):
-    response = openai.Embedding.create(
-        input=[text],
-        model="text-embedding-ada-002"
-    )
-    return response['data'][0]['embedding'], response['usage']['total_tokens']
 
-# ========== Core Functions ==========
-def load_all_vector_dbs():
-    global combined_embeddings, all_chunks
+def get_openai_embedding(text: str) -> Tuple[List[float], int]:
+    """
+    Uses OpenAI embeddings API (text-embedding-ada-002) and returns (embedding, tokens_used_for_embedding)
+    """
+    resp = openai.Embedding.create(input=[text], model="text-embedding-ada-002")
+    return resp['data'][0]['embedding'], resp['usage']['total_tokens']
+
+# ========== FAISS Loading & Search ==========
+def load_all_vector_dbs() -> bool:
+    """
+    Load all .index files from VECTOR_DB_DIR and their metadata.
+    Merges them into a single FAISS index if multiple are found.
+    """
+    global faiss_index, combined_chunks, index_dimension
 
     if not os.path.exists(VECTOR_DB_DIR):
         print(f"Vector DB directory '{VECTOR_DB_DIR}' not found")
         return False
 
-    db_files = [f for f in os.listdir(VECTOR_DB_DIR) if f.endswith('.npy')]
+    db_files = [f for f in os.listdir(VECTOR_DB_DIR) if f.endswith('.index')]
     if not db_files:
-        print("No vector databases found")
+        print("No FAISS index files found in vector_db/")
         return False
 
-    all_chunks.clear()
-    embeddings_list = []
+    combined_chunks = []
+    indexes = []
+    dims = set()
 
-    for db_file in db_files:
-        db_name = db_file.replace('.npy', '')
-        db_path = os.path.join(VECTOR_DB_DIR, db_name)
+    for db_file in sorted(db_files):
+        base = db_file[:-len(".index")]
+        index_path = os.path.join(VECTOR_DB_DIR, db_file)
+        meta_path = os.path.join(VECTOR_DB_DIR, f"{base}_metadata.json")
 
-        embeddings = np.load(f"{db_path}.npy")
-        embeddings_list.append(embeddings)
+        print(f"Loading FAISS index: {index_path}")
+        try:
+            index = faiss.read_index(index_path)
+        except Exception as e:
+            print(f"Failed to read index {index_path}: {e}")
+            continue
 
-        with open(f"{db_path}_metadata.json", 'r') as f:
-            metadata = json.load(f)
-            all_chunks.extend(metadata['chunks'])
+        # Determine dimension from index (works for flat indexes)
+        try:
+            # index.d is available for some index types
+            dim = faiss.vector_to_array(index.reconstruct(0)).shape[0] if index.ntotal > 0 else None
+        except Exception:
+            dim = None
 
-    combined_embeddings = np.vstack(embeddings_list)
+        # fallback: try to get d from index description if possible
+        try:
+            ddesc = str(index)
+            # This is heuristic and may not always work. If not available, dimension will be set below.
+            if "d=" in ddesc:
+                # parse e.g. 'IndexFlatL2(d=1536)'
+                import re
+                m = re.search(r"d\s*=\s*(\d+)", ddesc)
+                if m:
+                    dim = int(m.group(1))
+        except Exception:
+            pass
+
+        if dim is not None:
+            dims.add(dim)
+
+        indexes.append(index)
+
+        # load metadata
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+                if "chunks" in metadata:
+                    combined_chunks.extend(metadata["chunks"])
+        else:
+            print(f"Warning: metadata {meta_path} not found for index {index_path}")
+
+    # Validate dimensions
+    if len(dims) == 0:
+        # try to infer from first chunk embedding in metadata
+        found_dim = None
+        for ch in combined_chunks:
+            if "embedding" in ch and isinstance(ch["embedding"], list):
+                found_dim = len(ch["embedding"])
+                break
+        if found_dim:
+            index_dimension = found_dim
+        else:
+            print("Could not determine embedding dimension. Aborting load.")
+            return False
+    elif len(dims) == 1:
+        index_dimension = dims.pop()
+    else:
+        # multiple dimensions found across indexes -> incompatible
+        print("Incompatible index dimensions found across FAISS indexes:", dims)
+        return False
+
+    # Merge indexes (if multiple)
+    if len(indexes) == 1:
+        faiss_index = indexes[0]
+    else:
+        try:
+            # concat_indexes requires all indexes to be the same type/dimension
+            faiss_index = faiss.merge_indexes(indexes) if hasattr(faiss, "merge_indexes") else faiss.concat_indexes(indexes)
+        except Exception as e:
+            print("Failed to merge FAISS indexes. Attempting sequential search fallback.", e)
+            # fallback: keep list of indexes and do sequential search (we'll handle this below)
+            faiss_index = None
+            app.state._faiss_indexes = indexes  # attach to app state for fallback
+            app.state._use_sequential_search = True
+
+    print(f"Loaded {len(combined_chunks)} chunks from {len(db_files)} indexes. Dimension: {index_dimension}")
     return True
 
-def search_similar_chunks(query, k=5):
-    global combined_embeddings, all_chunks
 
-    if combined_embeddings is None:
-        print("Knowledge base not initialized")
-        return []
+def search_similar_chunks(query: str, k: int = 5) -> Tuple[List[Dict], int]:
+    """
+    Returns top-k chunk dicts and embedding token usage.
+    If merged faiss_index exists, uses single search; otherwise uses sequential search across indexes.
+    """
+    global faiss_index, combined_chunks, index_dimension
 
-    query_embedding, embedding_tokens = get_openai_embedding(query)
-    similarities = cosine_similarity([query_embedding], combined_embeddings)[0]
-    top_k_indices = similarities.argsort()[::-1][:k]
-    return [all_chunks[i] for i in top_k_indices], embedding_tokens
+    # create query embedding
+    q_emb, embed_tokens = get_openai_embedding(query)
+    q_vec = np.array(q_emb).astype('float32').reshape(1, -1)
 
-def generate_response(user_input, history: List[Dict[str, str]]):
+    if faiss_index is not None:
+        # Search merged index
+        D, I = faiss_index.search(q_vec, k)
+        indices = I[0].tolist()
+        results = []
+        for idx in indices:
+            if idx < len(combined_chunks):
+                results.append(combined_chunks[idx])
+        return results, embed_tokens
+
+    # fallback: sequential search across indexes stored in app.state._faiss_indexes
+    if getattr(app.state, "_use_sequential_search", False):
+        all_scores = []
+        all_idxs = []
+        base_offset = 0
+        chunks_accum = []
+        # gather chunks for each index from metadata order: we already combined chunks in load_all_vector_dbs()
+        # We'll compute nearest neighbors by searching each index and collecting (distance, global_index)
+        for index in getattr(app.state, "_faiss_indexes", []):
+            try:
+                D, I = index.search(q_vec, k)
+                for dist, local_idx in zip(D[0], I[0]):
+                    if local_idx == -1:
+                        continue
+                    global_idx = base_offset + int(local_idx)
+                    all_scores.append(float(dist))
+                    all_idxs.append(global_idx)
+            except Exception:
+                pass
+            # increment base_offset by the number of vectors in this index
+            base_offset += index.ntotal
+
+        # sort best k by distance (L2, lower is better)
+        ranked = sorted(zip(all_scores, all_idxs), key=lambda x: x[0])
+        top = [gid for (_, gid) in ranked[:k]]
+        results = [combined_chunks[i] for i in top if i < len(combined_chunks)]
+        return results, embed_tokens
+
+    # If nothing available
+    return [], embed_tokens
+
+# ========== RAG / Chat Generation ==========
+def generate_response(user_input: str, history: List[Dict[str, str]]):
     relevant_chunks, embedding_tokens = search_similar_chunks(user_input)
     if not relevant_chunks:
         context = None
-        # return "I couldn't find relevant information to answer your question.", 0, 0, 0, embedding_tokens
     else:
         context_parts = [
-            f"Source: {chunk['source']}\nContent: {chunk['text']}"
+            f"Source: {chunk.get('source','')}\nContent: {chunk.get('text','')}"
             for chunk in relevant_chunks
         ]
         context = "\n\n".join(context_parts)
@@ -149,11 +263,10 @@ def generate_response(user_input, history: List[Dict[str, str]]):
         for msg in history[-3:]
     ]
     history_text = "\n".join(history_parts)
-    #print(history_text)
 
     prompt = f"""
     Role:
-    You are a helpful, accurate assistant for DukeToms, designed to respond using only the information provided.
+    You are a helpful, accurate assistant designed to respond using only the information provided.
 
     Context:
     {context}
@@ -163,35 +276,13 @@ def generate_response(user_input, history: List[Dict[str, str]]):
 
     Customer Question: {user_input}
 
-    Fallback Instructions (Mandatory):
-    If the answer to a question is NOT found in the {context} or in the {history_text}, respond with this **exact fallback format**:
+    Fallback Instructions (MANDATORY):
+    If the answer to a question is NOT found in the {context} or in the {history_text}, respond with this exact fallback format:
 
-    "I'm sorry, but [specific information] is not available with me. For detailed information, please contact us directly via the contact page.  
-    Source: https://duketoms.com/contact/"
+    "I'm sorry, but [specific information] is not available with me. For detailed information, please contact us directly via the contact page.
+    Source: https://nivatier.com/contact/"
 
-    Just replace [specific information] with the topic (e.g., “pricing”, “return policy”, “delivery info”).
-
-    ⚠️ Do NOT reword or rephrase this fallback. Do NOT guess. Always follow this format word-for-word when the context is missing.  
-    ⚠️ Use line breaks for: lists, category names, or multiple links.
-
-    Tone: 80% Professional Helper, 20% Playful Buddy (warm tone for informal chats or follow-ups).
-
-    Guidelines:
-    1. ONLY use the provided context – no assumptions or outside info.
-    2. Ask for the user's name in the first interaction to personalize the chat.
-    3. Use their name in future messages to maintain a friendly tone.
-    4. If answer is missing, ALWAYS use the exact fallback above.
-    5. BE BRIEF.
-       – 1–2 lines only.
-       – Don’t list features unless asked.
-       – End with: “Let me know if you'd like more info.”
-    6. ALWAYS include a **Source URL** for every answer, even if it’s generic:  
-       Source: https://duketoms.com/page-name  
-       (If page not available, use: https://duketoms.com/contact/)
-    7. Use line breaks for category lists, like:  
-       a. Hygiene Solutions  
-       b. Microbial and Safety Testing  
-       c. Specialized Industry Solutions
+    Do NOT reword the fallback. Do NOT guess.
     """
 
     try:
@@ -204,25 +295,22 @@ def generate_response(user_input, history: List[Dict[str, str]]):
             temperature=0.3
         )
         choice = response['choices'][0]['message']['content']
-        usage = response['usage']
-        return choice, usage['prompt_tokens'], usage['completion_tokens'], usage['total_tokens'], embedding_tokens
+        usage = response.get('usage', {})
+        return choice, usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0), usage.get('total_tokens', 0), embedding_tokens
     except Exception as e:
         return f"Error: {str(e)}", 0, 0, 0, 0
-
 
 # ========== FastAPI Endpoints ==========
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest):
     try:
         user_input = request.message.strip()
-        client_id = request.clientId  # Access client ID here
-        print(request)
-        #print(request.history)
+        client_id = request.clientId
         if not user_input:
             raise HTTPException(status_code=400, detail="Message is required")
 
         response, input_toks, output_toks, total_toks, embed_toks = generate_response(
-            user_input, [msg.dict() for msg in request.history]
+            user_input, [msg.dict() if hasattr(msg, "dict") else msg for msg in request.history]
         )
 
         chat_cost = (input_toks / 1000) * 0.01 + (output_toks / 1000) * 0.03
@@ -245,11 +333,16 @@ async def chat_endpoint(request: ChatRequest):
 
         return {"reply": response}
     except Exception as e:
-        return f"Error: {str(e)}"
+        raise HTTPException(status_code=500, detail=str(e))
 
-# ========== Startup Events ==========
+# ========== Startup ==========
 @app.on_event("startup")
 async def on_startup():
     print("Loading vector databases...")
-    if not load_all_vector_dbs():
-        print("Failed to load vector databases")
+    ok = load_all_vector_dbs()
+    if not ok:
+        print("Failed to load vector databases. Make sure you ran embed_scraper.py to generate .index files.")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)

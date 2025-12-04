@@ -1,0 +1,1 @@
+this app was originally looking for embeeding in the json file which is unnecessary as we dont need to store embedding data inside json. it will only increase the file size. 

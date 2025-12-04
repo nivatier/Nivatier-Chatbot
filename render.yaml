@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: fastapi-chatbot
+    name: nivatier-chatbot
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app:app --host 0.0.0.0 --port 5000"
-    plan: free
-    region: us
-    instanceClass: 1X
+    plan: free   # or starter / standard, depending on your preference
+    pythonVersion: 3.11
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port 8000
+    autoDeploy: true

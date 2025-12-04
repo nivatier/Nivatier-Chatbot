@@ -1,15 +1,22 @@
-fastapi
-uvicorn
-openai==0.27.8
-python-dotenv==1.0.0
-numpy==1.24.3
-scikit-learn==1.3.0
-pydantic
-tiktoken
-gspread
-oauth2client
-google-api-python-client
-google-auth
-google-auth-httplib2
-google-auth-oauthlib
-flask-cors==3.0.10
+# Web framework
+fastapi==0.123.7         # Core framework for building API endpoints
+uvicorn==0.23.2          # ASGI server to run FastAPI asynchronously
+
+# OpenAI API
+openai==0.27.8           # Official SDK to call GPT models and embeddings
+
+# Environment variables
+python-dotenv==1.0.0     # Loads environment variables from a .env file
+
+# FAISS for vector search
+faiss-cpu==1.7.4         # Efficient similarity search for embeddings (CPU version)
+
+# Numpy for numerical operations
+numpy==1.24.3             # Array and numerical computations required by FAISS and embeddings
+
+# Google Sheets API
+google-api-python-client==2.90.0  # Interact with Google Sheets API
+google-auth==2.23.0                # Authentication for Google APIs using service accounts
+
+# Token counting for OpenAI models
+tiktoken==0.4.0          # Tokenizer for counting tokens for cost estimation and prompt handling
